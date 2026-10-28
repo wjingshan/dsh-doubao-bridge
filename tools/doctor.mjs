@@ -224,7 +224,7 @@ async function main() {
   console.log('');
   let requiredFailed = 0;
   for (const r of results) {
-    const mark = r.ok ? '✅' : (r.required ? '❌' : '⚠️ ');
+    const mark = r.info ? 'ℹ️ ' : (r.ok ? '✅' : (r.required ? '❌' : '⚠️ '));
     if (!r.ok && r.required) requiredFailed++;
     console.log(`${mark} ${r.name}${r.detail ? ' — ' + r.detail : ''}`);
     if (!r.ok && r.hint) console.log(`     → ${r.hint}`);
