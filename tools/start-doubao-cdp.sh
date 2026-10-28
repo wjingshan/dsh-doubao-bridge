@@ -81,27 +81,41 @@ if ! EXE="$(find_doubao)"; then
   exit 1
 fi
 
-WORKDIR="$(cd "$(dirname "$EXE")/../.." 2>/dev/null && pwd || dirname "$EXE")"
+WORKDIR="$(dirname "$EXE")"
 echo "豆包：$EXE"
 
-# 1) Close existing instances.
-if pgrep -f "Doubao" >/dev/null 2>&1; then
+# 1) Close existing instances. Match the exact process name: `pkill -f Doubao`
+#    also kills anything whose command line merely mentions it.
+if pgrep -x Doubao >/dev/null 2>&1; then
   echo "关闭正在运行的豆包进程（未发送的草稿会丢失）..."
-  pkill -f "Doubao" 2>/dev/null || true
+  pkill -x Doubao 2>/dev/null || true
   sleep 3
-  pkill -9 -f "Doubao" 2>/dev/null || true
+  pkill -9 -x Doubao 2>/dev/null || true
   sleep 1
 fi
 
 # 2) Launch with the DevTools endpoint open.
 echo "以 --remote-debugging-port=$PORT 启动..."
-if command -v open >/dev/null 2>&1; then
-  # macOS: `open -a` would drop the flags, so exec the binary directly.
-  nohup "$EXE" --remote-debugging-port="$PORT" --remote-debugging-address=127.0.0.1 \
-    >/dev/null 2>&1 &
-else
-  nohup "$EXE" --remote-debugging-port="$PORT" --remote-debugging-address=127.0.0.1 \
-    >/dev/null 2>&1 &
+LOG="$(mktemp -t doubao-cdp-launch)"
+( cd "$WORKDIR" && nohup "$EXE" \
+    --remote-debugging-port="$PORT" --remote-debugging-address=127.0.0.1 \
+    >"$LOG" 2>&1 & echo $! > "$LOG.pid" ) || {
+  echo "失败：无法启动豆包进程。" >&2
+  sed -n '1,10p' "$LOG" >&2 2>/dev/null || true
+  rm -f "$LOG" "$LOG.pid"
+  exit 1
+}
+LAUNCH_PID="$(cat "$LOG.pid" 2>/dev/null || true)"
+rm -f "$LOG.pid"
+
+# Fail fast if the process died immediately (bad permissions, wrong binary, or
+# an Electron single-instance lock stealing the launch).
+sleep 2
+if [ -n "$LAUNCH_PID" ] && ! kill -0 "$LAUNCH_PID" 2>/dev/null; then
+  echo "失败：豆包进程启动后立即退出。" >&2
+  sed -n '1,15p' "$LOG" >&2 2>/dev/null || true
+  rm -f "$LOG"
+  exit 1
 fi
 
 # 3) Wait for the port.
@@ -113,9 +127,13 @@ for i in $(seq 1 30); do
       curl -s "http://127.0.0.1:$PORT/json/version" 2>/dev/null | head -c 300 || true
       echo
     fi
+    rm -f "$LOG"
     exit 0
   fi
 done
 
 echo "失败：30 秒内端口 $PORT 未就绪。" >&2
+echo "启动输出（前 15 行）：" >&2
+sed -n '1,15p' "$LOG" >&2 2>/dev/null || true
+rm -f "$LOG"
 exit 1

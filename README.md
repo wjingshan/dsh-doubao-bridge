@@ -119,6 +119,7 @@ export DOUBAO_EXE="/Applications/Doubao.app/Contents/MacOS/Doubao"
 | `doubao_run_task` | 开新任务、发指令、等完成、返回报告 |
 | `doubao_handoff` | **移交项目**：记录归属 + 按目录下发 + 等完成 |
 | `doubao_return` | **收回**：读最终报告 + 归属切回 DeepSeek |
+| `doubao_reply` | 豆包中途反问时，把用户的选择送回去并继续等完成 |
 
 ### 借用豆包独有的能力
 

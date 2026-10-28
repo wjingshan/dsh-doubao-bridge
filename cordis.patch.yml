@@ -1,10 +1,10 @@
 # Doubao (豆包) desktop bridge — MCP server + Web UI badge, one bundle.
 #
-# Prerequisite: the Doubao PC app must run once with
+# Prerequisite: the Doubao desktop app must run once with
 #   --remote-debugging-port=9225 --remote-debugging-address=127.0.0.1
-# Run tools/start-doubao-cdp.ps1 to do that. When Doubao is closed the tools
-# only report a connection error; failOnStartupError:false keeps the harness
-# booting anyway.
+# Run `node tools/start-doubao-cdp.mjs` (cross-platform) to do that. When Doubao
+# is closed the tools only report a connection error; failOnStartupError:false
+# keeps the harness booting anyway.
 #
 # `command: node` resolves through PATH, and the MCP client runs servers with
 # the profile directory as cwd (verified), so the script path below stays
@@ -19,8 +19,6 @@
         args:
           - 'node_modules/dsh-doubao-bridge/server.mjs'
           - '--mcp'
-        env:
-          DOUBAO_REVISION: '2'
         # A task-mode handoff routinely takes minutes; give it room.
         toolCallTimeoutMs: 900000
         failOnStartupError: false

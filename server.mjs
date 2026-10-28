@@ -16,6 +16,18 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Single source of truth for the version reported in the MCP handshake. It used
+// to be a hardcoded '1.0.0' while package.json said 3.x, which makes version
+// checks lie.
+const VERSION = (() => {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+    return pkg.version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 // Handoff state lives under the harness home so it survives moving the package.
 const HANDOFF_DIR = process.env.DOUBAO_HANDOFF_DIR || path.join(os.homedir(), '.dsh', 'doubao-handoff');
 const STATE_FILE = path.join(HANDOFF_DIR, 'state.json');
@@ -579,29 +591,42 @@ const RUN_STATE_JS = `(() => {
     thinking: txt.includes('正在思考'),
     executing: /正在执行代码/.test(txt),
     elapsed,
+    // How many assistant bubbles exist. The caller snapshots this BEFORE
+    // submitting, so completion can be judged on NEW messages only. Without it,
+    // a stale report carrying HANDOFF-DONE (e.g. the previous handoff still on
+    // screen because "新工作任务" reused the conversation) makes a fresh task
+    // look finished the moment it is sent.
+    assistantCount: assistants.length,
     lastAssistant,
     trace: txt
   };
 })()`;
 
-async function waitForRun({ evalJs }, { marker, timeoutMs, startedAt }) {
+// `baseline` is the assistant-bubble count captured before this run started.
+// A run only counts as done when a bubble created AFTER that baseline carries
+// the marker — never a leftover from a previous handoff.
+async function waitForRun({ evalJs }, { marker, timeoutMs, startedAt, baseline = 0 }) {
   const t0 = startedAt || Date.now();
   let snapshot = null;
+  const isNew = (s) => (s.assistantCount || 0) > baseline;
+
   while (Date.now() - t0 < timeoutMs) {
     await sleep(3000);
     snapshot = await evalJs(RUN_STATE_JS);
     const busy = snapshot.running || snapshot.thinking || snapshot.executing;
 
-    if (snapshot.lastAssistant.includes(marker) && !busy) {
-      await sleep(2000);
-      snapshot = await evalJs(RUN_STATE_JS);
-      return { status: 'done', snapshot, elapsedMs: Date.now() - t0 };
-    }
+    // A question outranks the marker: an asking run must reach the user even if
+    // the last bubble happens to quote the marker.
     if (snapshot.asking && !busy) {
       return { status: 'needs-user', snapshot, elapsedMs: Date.now() - t0 };
     }
-    if (snapshot.finished && !busy && snapshot.lastAssistant.includes(marker)) {
-      return { status: 'done', snapshot, elapsedMs: Date.now() - t0 };
+    if (isNew(snapshot) && snapshot.lastAssistant.includes(marker) && !busy) {
+      await sleep(2000);
+      const confirm = await evalJs(RUN_STATE_JS);
+      if (isNew(confirm) && confirm.lastAssistant.includes(marker) && !busy) {
+        return { status: 'done', snapshot: confirm, elapsedMs: Date.now() - t0 };
+      }
+      snapshot = confirm;
     }
   }
   return { status: 'timeout', snapshot, elapsedMs: Date.now() - t0 };
@@ -614,8 +639,10 @@ async function driveTask({ send, evalJs, page }, text, timeoutMs, marker = 'HAND
   await sleep(2600);
 
   // The fresh task page has settled; remember how many messages it had before
-  // we submit, so the live view can show only this run's output.
+  // we submit, so the live view can show only this run's output, and remember
+  // the assistant-bubble count so completion is judged on NEW messages only.
   const before = await evalJs(JS.read);
+  const preRun = await evalJs(RUN_STATE_JS);
   liveWindow = { url: page.url, startCount: before.count, at: Date.now() };
 
   const focus = await evalJs(JS.focusEditor);
@@ -627,7 +654,9 @@ async function driveTask({ send, evalJs, page }, text, timeoutMs, marker = 'HAND
   const clicked = await realClick(send, evalJs, `document.querySelector('[data-testid="chat_input_send_button"]')`);
   if (!clicked.ok) throw new Error('send button not clickable');
 
-  const r = await waitForRun({ evalJs }, { marker, timeoutMs, startedAt: Date.now() });
+  const r = await waitForRun({ evalJs }, {
+    marker, timeoutMs, startedAt: Date.now(), baseline: preRun.assistantCount || 0
+  });
   return {
     typed,
     elapsedMs: r.elapsedMs,
@@ -647,6 +676,7 @@ async function cmdReply({ answer, timeoutMs = 900000, marker = 'HANDOFF-DONE' })
     const focus = await evalJs(JS.focusEditor);
     if (!focus.ok) throw new Error(focus.error || 'editor not ready');
     const before = await evalJs(JS.read);
+    const preRun = await evalJs(RUN_STATE_JS);
     liveWindow = { url: page.url, startCount: before.count, at: Date.now() };
     await send('Input.insertText', { text: answer });
     await sleep(500);
@@ -654,7 +684,9 @@ async function cmdReply({ answer, timeoutMs = 900000, marker = 'HANDOFF-DONE' })
     if (!clicked.ok) throw new Error('send button not clickable');
 
     const started = Date.now();
-    const r = await waitForRun({ evalJs }, { marker, timeoutMs, startedAt: started });
+    const r = await waitForRun({ evalJs }, {
+      marker, timeoutMs, startedAt: started, baseline: preRun.assistantCount || 0
+    });
     return {
       answered: answer,
       elapsedMs: r.elapsedMs,
@@ -760,6 +792,18 @@ const LIVE_TTL_MS = 900;
 // whole reused conversation.
 let liveWindow = { url: null, startCount: 0, at: 0 };
 
+// A window must expire. Without this, chatting with Doubao by hand after a call
+// left a stale baseline behind, so the next card sliced the transcript at the
+// old offset and showed messages that were never part of any run.
+// 30 min covers the longest legitimate handoff (default timeout is 15 min).
+const LIVE_WINDOW_TTL_MS = 30 * 60 * 1000;
+
+function liveWindowSince(url) {
+  if (!liveWindow.url || liveWindow.url !== url) return 0;
+  if (Date.now() - liveWindow.at > LIVE_WINDOW_TTL_MS) return 0;
+  return liveWindow.startCount;
+}
+
 // While a task RUNS, the live trace is rendered directly inside
 // [data-testid="message-list"] and grows in place: the narration lines, then
 // "正在执行代码 ..." lines. The preamble-elapsed section only holds the timer —
@@ -819,7 +863,7 @@ async function readLive() {
         messages: r.messages || [],
         last: bubbles[bubbles.length - 1] || '',
         count: bubbles.length,
-        since: page.url === liveWindow.url ? liveWindow.startCount : 0,
+        since: liveWindowSince(page.url),
         url: page.url,
         title: page.title
       };
@@ -834,13 +878,36 @@ async function readLive() {
   return data;
 }
 
+// CORS for the read-only badge endpoints.
+//
+// These handlers expose Doubao's transcript, so `Access-Control-Allow-Origin: *`
+// was a real leak: ANY page the user visits could fetch /live from the loopback
+// port and read the whole conversation (and /env's environment snapshot).
+// Binding 127.0.0.1 only stops the LAN, not a hostile page in the browser.
+//
+// The harness page is served from http://127.0.0.1:<random port> (the port
+// changes between restarts), so echo the Origin back only when it is a loopback
+// origin. Anything else gets no ACAO header and the browser blocks the read.
+const LOOPBACK_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
+
+function corsFor(req) {
+  const origin = req.headers.origin || '';
+  const base = {
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Cache-Control': 'no-store',
+    Vary: 'Origin'
+  };
+  if (origin && LOOPBACK_ORIGIN.test(origin)) {
+    return { ...base, 'Access-Control-Allow-Origin': origin };
+  }
+  // No ACAO: a cross-site page can still send the request, but cannot read it.
+  return base;
+}
+
 function startStateServer(port = 9226) {
   const srv = http.createServer(async (req, res) => {
-    const cors = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
-    };
+    const cors = corsFor(req);
     if (req.method === 'OPTIONS') {
       res.writeHead(204, cors);
       res.end();
@@ -855,7 +922,7 @@ function startStateServer(port = 9226) {
       const running = s.status === 'running';
       const fresh = idleMs < DOUBAO_FRESH_MS;
       const effectiveOwner = (running || fresh) ? 'doubao' : 'deepseek';
-      res.writeHead(200, { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
         ...s,
         effectiveOwner,
@@ -867,30 +934,25 @@ function startStateServer(port = 9226) {
     // Live view of Doubao's current output, polled by the UI panel.
     if (route === '/live') {
       const data = await readLive();
-      res.writeHead(200, { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data));
       return;
     }
-    // Diagnostic: report the environment the harness handed this server.
+    // Diagnostic endpoint. Deliberately narrow: it once returned USERPROFILE /
+    // HOME / execPath, which turned a badge endpoint into an identity leak.
     if (route === '/env') {
-      res.writeHead(200, { ...cors, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
-        cwd: process.cwd(),
-        argv: process.argv,
-        execPath: process.execPath,
         nodeVersion: process.version,
         platform: process.platform,
         arch: process.arch,
+        badgePort: port,
+        cdp: ENDPOINT,
+        handoffDir: HANDOFF_DIR,
         env: {
           DOUBAO_CDP: process.env.DOUBAO_CDP || null,
           DOUBAO_BADGE_PORT: process.env.DOUBAO_BADGE_PORT || null,
-          DOUBAO_EXE: process.env.DOUBAO_EXE || null,
-          // Both spellings: USERPROFILE on Windows, HOME everywhere.
-          USERPROFILE: process.env.USERPROFILE || null,
-          HOME: process.env.HOME || null,
-          LOCALAPPDATA: process.env.LOCALAPPDATA || null,
-          DSH_PROFILE: process.env.DSH_PROFILE || null,
-          DSH_PROFILE_DIR: process.env.DSH_PROFILE_DIR || null
+          DOUBAO_EXE: process.env.DOUBAO_EXE || null
         }
       }));
       return;
@@ -898,8 +960,18 @@ function startStateServer(port = 9226) {
     res.writeHead(404, cors);
     res.end('not found');
   });
-  // If another instance already holds the port, keep serving MCP over stdio.
-  srv.on('error', () => {});
+  // Never let a bind failure kill the MCP server: stdio must keep working even
+  // when the badge port is taken. But do not swallow it silently either — the
+  // old `() => {}` made "状态服务未连接" undiagnosable.
+  srv.on('error', (err) => {
+    const code = err && err.code;
+    if (code === 'EADDRINUSE') {
+      console.error(`[doubao-bridge] badge port ${port} already in use; ` +
+        'the UI badge will be unavailable, MCP tools still work');
+      return;
+    }
+    console.error('[doubao-bridge] badge server error:', (err && err.message) || err);
+  });
   srv.listen(port, '127.0.0.1');
   return srv;
 }
@@ -1099,7 +1171,7 @@ async function mcpMain() {
         result: {
           protocolVersion: params?.protocolVersion || '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'doubao-desktop', version: '1.0.0' }
+          serverInfo: { name: 'doubao-desktop', version: VERSION }
         }
       });
     } else if (method === 'notifications/initialized' || method === 'initialized') {

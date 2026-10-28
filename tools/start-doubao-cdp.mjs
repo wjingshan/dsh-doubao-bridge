@@ -123,12 +123,14 @@ function killExisting() {
       sleepSync(3500);
     }
   } else {
+    // Match the exact process name. `pkill -f Doubao` was too broad: it kills
+    // any process whose command line merely contains "Doubao".
     try {
-      execFileSync('pkill', ['-f', 'Doubao'], { stdio: 'ignore' });
+      execFileSync('pkill', ['-x', 'Doubao'], { stdio: 'ignore' });
     } catch { /* nothing running */ }
     sleepSync(2500);
     try {
-      execFileSync('pkill', ['-9', '-f', 'Doubao'], { stdio: 'ignore' });
+      execFileSync('pkill', ['-9', '-x', 'Doubao'], { stdio: 'ignore' });
     } catch { /* nothing running */ }
     sleepSync(1000);
   }
@@ -155,7 +157,10 @@ async function main() {
     return 1;
   }
 
-  const workDir = resolve(dirname(exe), '..');
+  // cwd = the binary's own directory. The .ps1 already did this and the .sh used
+  // two levels up, so the three launchers disagreed; Electron does not need the
+  // extra hop and a stable rule is easier to reason about.
+  const workDir = dirname(exe);
   console.log(`豆包：${exe}`);
 
   console.log('关闭正在运行的豆包进程（未发送的草稿会丢失）...');
@@ -170,10 +175,21 @@ async function main() {
     detached: true,
     stdio: 'ignore'
   });
+  // A failed spawn used to be invisible: the only symptom was "port not ready"
+  // 30 seconds later. Surface the real reason instead.
+  let spawnError = null;
+  child.once('error', (err) => { spawnError = err; });
   child.unref();
 
   for (let i = 1; i <= 30; i++) {
     await new Promise((r) => setTimeout(r, 1000));
+    if (spawnError) {
+      console.error(`失败：豆包进程启动失败：${spawnError.message}`);
+      if (spawnError.code === 'EACCES') {
+        console.error('  该文件不可执行。检查 DOUBAO_EXE 是否指向真实的二进制文件。');
+      }
+      return 1;
+    }
     if (await portOpen(PORT)) {
       console.log(`成功：127.0.0.1:${PORT} 已就绪（约 ${i}s）。`);
       try {

@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     // Bump on every change. Shown next to the status dot so the user can SEE
     // which build is actually loaded (the frameless window hides document.title).
-    const BUILD = 'b32';
+    const BUILD = 'b33';
 
     function label(s) {
       // effectiveOwner is computed server-side from real activity, so the lamp
