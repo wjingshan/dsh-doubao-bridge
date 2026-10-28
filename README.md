@@ -19,6 +19,35 @@ macOS 路径依赖 Homebrew cask 的 `Doubao.app`，代码与 Windows 版共用�
 | Node.js ≥ 22 | 需要内置的全局 `WebSocket`；DSH 本身也依赖 Node |
 | DSH profile | 装到哪个 profile 都行 |
 
+## 先自检（装之前就能跑）
+
+不确定这台机器能不能用？**不需要先装插件**，clone 下来直接跑自检：
+
+```bash
+git clone https://github.com/wjingshan/dsh-doubao-bridge.git
+cd dsh-doubao-bridge
+node tools/doctor.mjs
+```
+
+它会按依赖顺序检查：Node 版本 → 全局 `WebSocket` → 豆包是否安装 → 调试端口 →
+CDP 是否响应 → 是否找到豆包聊天页面 →（如果已装）徽章端口与 profile。
+
+输出长这样：
+
+```
+✅ Node.js ≥ 22 — v24.19.0
+✅ 全局 WebSocket 可用
+✅ 找到豆包可执行文件 — /Applications/Doubao.app/Contents/MacOS/Doubao（auto）
+✅ 调试端口 9225 在监听
+✅ CDP 响应 — Chrome/1xx.0.xxxx
+✅ 找到豆包聊天页面 — doubao://doubao-chat/chat/…
+⚠️  插件尚未装进任何 profile — 已发现: desktop
+     → 装法见 README「安装」一节；这一项不影响上面的探测结果
+```
+
+**这一步是分层验证的地基**：如果豆包在 macOS 上根本不接受
+`--remote-debugging-port`，插件装得再对也没用。先确认端口通，再谈安装。
+
 ## 安装
 
 三步，第一步只需要做一次。
@@ -334,6 +363,7 @@ MCP 条目的 `env` 里可以覆盖（默认值见括号）：
 | `server.mjs` | MCP server + CLI，全部逻辑 |
 | `client.js` / `index.js` | 界面状态徽章 + 对话气泡（Client 插件） |
 | `cordis.patch.yml` | 挂载 MCP 与徽章 |
+| `tools/doctor.mjs` | **前置自检**（装之前就能跑，分层验证） |
 | `tools/start-doubao-cdp.mjs` | **跨平台**启动器（Node，macOS/Linux 推荐） |
 | `tools/start-doubao-cdp.sh` | 跨平台 shell 版 |
 | `tools/start-doubao-cdp.ps1` | Windows PowerShell 版 |

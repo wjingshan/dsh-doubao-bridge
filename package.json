@@ -1,6 +1,6 @@
 {
   "name": "dsh-doubao-bridge",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "type": "module",
   "description": "Drive the local Doubao (豆包) desktop app from DeepSeek Harness: read chats, send tasks, hand a project over and take it back.",
   "keywords": [
@@ -31,7 +31,8 @@
   },
   "scripts": {
     "start-cdp": "node tools/start-doubao-cdp.mjs",
-    "check": "node --check server.mjs && node --check client.js && node --check tools/start-doubao-cdp.mjs"
+    "check": "node --check server.mjs && node --check client.js && node --check tools/start-doubao-cdp.mjs",
+    "doctor": "node tools/doctor.mjs"
   },
   "dsh": {
     "bundle": {
