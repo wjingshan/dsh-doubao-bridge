@@ -1,0 +1,48 @@
+{
+  "name": "dsh-doubao-bridge",
+  "version": "3.1.0",
+  "type": "module",
+  "description": "Drive the local Doubao (豆包) desktop app from DeepSeek Harness: read chats, send tasks, hand a project over and take it back.",
+  "keywords": [
+    "dsh",
+    "cordis",
+    "doubao",
+    "豆包",
+    "mcp",
+    "bridge"
+  ],
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "bin": {
+    "doubao-bridge": "./server.mjs"
+  },
+  "files": [
+    "client.js",
+    "index.js",
+    "server.mjs",
+    "cordis.patch.yml",
+    "tools/"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start-cdp": "node tools/start-doubao-cdp.mjs",
+    "check": "node --check server.mjs && node --check client.js && node --check tools/start-doubao-cdp.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

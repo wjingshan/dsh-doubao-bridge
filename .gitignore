@@ -1,0 +1,23 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Lockfiles are not committed: this package is installed as a DSH bundle, and a
+# stray lockfile would make `link:` installs behave differently across machines.
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local scratch
+*.local
+.env
+.env.*
