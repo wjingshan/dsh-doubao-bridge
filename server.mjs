@@ -13,6 +13,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ensureCdp } from './lib/doubao-launcher.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -37,6 +38,24 @@ const ENDPOINT = process.env.DOUBAO_CDP || 'http://127.0.0.1:9225';
 const BADGE_PORT = Number(process.env.DOUBAO_BADGE_PORT || 9226);
 const CHAT_PAGE = 'doubao-chat/chat';
 
+// Self-healing: when the debugging port disappeared (Doubao was restarted without
+// the flag, or auto-updated), restart it ourselves instead of failing every tool
+// call until the user runs a launcher by hand. `DOUBAO_AUTO_RESTART=0` disables
+// it. The cooldown stops a broken installation from entering a restart loop.
+const CDP_PORT = Number(new URL(ENDPOINT).port || 9225);
+const AUTO_RESTART = process.env.DOUBAO_AUTO_RESTART !== '0';
+const AUTO_RESTART_MIN_INTERVAL_MS = Number(process.env.DOUBAO_AUTO_RESTART_MIN_INTERVAL_MS || 60000);
+const LAUNCH_LOG = path.join(HANDOFF_DIR, 'cdp-launch.log');
+
+// A file channel, not just console: the MCP process's stdout is the protocol
+// stream, so anything we log there is invisible.
+function logLaunch(msg) {
+  try {
+    fs.mkdirSync(HANDOFF_DIR, { recursive: true });
+    fs.appendFileSync(LAUNCH_LOG, `[${new Date().toISOString()}] ${msg}\n`, 'utf8');
+  } catch { /* logging must never break a tool call */ }
+}
+
 // ---------- CDP plumbing ----------
 function connect(wsUrl) {
   const ws = new WebSocket(wsUrl);
@@ -56,11 +75,21 @@ function connect(wsUrl) {
   });
   const send = (method, params = {}, ms = 20000) => {
     const mid = ++id;
+    let timer = null;
     const p = new Promise((resolve, reject) => {
       pending.set(mid, { resolve, reject });
       ws.send(JSON.stringify({ id: mid, method, params }));
     });
-    return Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error('CDP timeout: ' + method)), ms))]);
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        pending.delete(mid); // otherwise a timed-out call leaks its entry
+        reject(new Error('CDP timeout: ' + method));
+      }, ms);
+    });
+    // Clearing the timer matters: an uncleared setTimeout keeps the event loop
+    // alive, so one-shot CLI runs stayed up for the full 20s timeout after they
+    // had already produced their output.
+    return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
   };
   return { ws, ready, send };
 }
@@ -73,28 +102,94 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let lastDoubaoTouch = 0;
 const DOUBAO_FRESH_MS = 30_000;
 
+async function listTargets() {
+  const res = await fetch(`${ENDPOINT}/json/list`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function pickPage(targets) {
+  return targets.find((t) => t.type === 'page' && t.url.includes(CHAT_PAGE))
+    || targets.find((t) => t.type === 'page' && t.url.includes('doubao-launcher'));
+}
+
+// Right after a restart the chat renderer can still be booting, so a missing
+// page is not a hard failure yet — give it a bounded window.
+async function waitForPage(timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const page = pickPage(await listTargets());
+      if (page) return page;
+    } catch {
+      return null; // endpoint went away; the caller reports the real error
+    }
+    if (Date.now() >= deadline) return null;
+    await sleep(1000);
+  }
+}
+
+// A fresh process exposes the bare `doubao-chat/chat` page within ~1s, long
+// before the renderer shows the editor or the conversation list. The URL is not
+// a usable signal (a restart can legitimately land on the home page), so the
+// only honest check is the DOM itself — done after the websocket is connected.
+// The sidebar list renders later than the editor; include it so `status`/`list`
+// do not report an empty account. An account with no conversations never
+// satisfies that, so the timeout still returns and the call proceeds.
+async function waitForEditor(evalJs, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      // Short per-probe timeout: while the page is navigating, Runtime.evaluate
+      // does not answer until the default 20s timeout, which would burn the
+      // whole budget on a single attempt.
+      const ok = await evalJs(
+        `document.readyState === 'complete' && !!document.querySelector('div.tiptap[contenteditable="true"]') && document.querySelectorAll('a[class*="conversation-item"]').length > 0`,
+        3000
+      );
+      if (ok) return true;
+    } catch { /* mid-navigation; retry until the deadline */ }
+    if (Date.now() >= deadline) return false;
+    await sleep(500);
+  }
+}
+
 async function withPage(fn) {
   let targets;
+  let restarted = false;
   try {
-    const res = await fetch(`${ENDPOINT}/json/list`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    targets = await res.json();
+    targets = await listTargets();
   } catch (err) {
-    throw new Error(`Cannot reach Doubao CDP at ${ENDPOINT}. Restart Doubao with --remote-debugging-port=9225. (${err.message})`);
+    if (!AUTO_RESTART) {
+      throw new Error(`Cannot reach Doubao CDP at ${ENDPOINT}. Restart Doubao with --remote-debugging-port=${CDP_PORT}. (${err.message})`);
+    }
+    const r = await ensureCdp({ port: CDP_PORT, minIntervalMs: AUTO_RESTART_MIN_INTERVAL_MS, log: logLaunch });
+    if (!r.ok) {
+      throw new Error(`Cannot reach Doubao CDP at ${ENDPOINT}, and auto-restart did not help (${r.reason || r.message || 'unknown'}). (${err.message})`);
+    }
+    restarted = r.restarted;
+    logLaunch(restarted ? `auto-restarted Doubao, ${r.waitedMs}ms` : 'port came back by itself');
+    try {
+      targets = await listTargets();
+    } catch (err2) {
+      throw new Error(`Cannot reach Doubao CDP at ${ENDPOINT} even after auto-restart. (${err2.message})`);
+    }
   }
-  const page = targets.find((t) => t.type === 'page' && t.url.includes(CHAT_PAGE))
-    || targets.find((t) => t.type === 'page' && t.url.includes('doubao-launcher'));
+  // After a restart the endpoint answers before the UI renders; wait for the
+  // editor so the first tool call does not read an empty shell.
+  const page = pickPage(targets) || await waitForPage();
   if (!page) throw new Error('Doubao chat page not found among CDP targets');
   const { ws, ready, send } = connect(page.webSocketDebuggerUrl);
   await ready;
   lastDoubaoTouch = Date.now();
-  const evalJs = async (expression) => {
-    const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+  const evalJs = async (expression, ms = 20000) => {
+    const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, ms);
     if (r.exceptionDetails) {
       throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'evaluate failed');
     }
     return r.result?.value;
   };
+  if (restarted) await waitForEditor(evalJs);
   try {
     return await fn({ page, send, evalJs });
   } finally {

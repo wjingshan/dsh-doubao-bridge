@@ -23,6 +23,7 @@
     "client.js",
     "index.js",
     "server.mjs",
+    "lib/",
     "cordis.patch.yml",
     "tools/"
   ],
@@ -31,7 +32,7 @@
   },
   "scripts": {
     "start-cdp": "node tools/start-doubao-cdp.mjs",
-    "check": "node --check server.mjs && node --check client.js && node --check tools/start-doubao-cdp.mjs",
+    "check": "node --check server.mjs && node --check client.js && node --check lib/doubao-launcher.mjs && node --check tools/start-doubao-cdp.mjs",
     "doctor": "node tools/doctor.mjs"
   },
   "dsh": {

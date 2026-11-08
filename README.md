@@ -106,10 +106,61 @@ export DOUBAO_EXE="/Applications/Doubao.app/Contents/MacOS/Doubao"
 
 装完重启 DSH 生效。
 
+## 让它以后自动带上参数（推荐，Windows）
+
+跑启动脚本是"每次豆包重启都要做一次"。想一劳永逸，用自启参数安装器：
+
+```powershell
+# 看当前状态（只读）
+powershell -ExecutionPolicy Bypass -File .\tools\enable-autostart-cdp.ps1 -Status
+
+# 让"开机自启"和"开始菜单"这两条入口都带上调试参数
+powershell -ExecutionPolicy Bypass -File .\tools\enable-autostart-cdp.ps1 -Apply
+
+# 不想要了就回滚（会按备份恢复原始命令）
+powershell -ExecutionPolicy Bypass -File .\tools\enable-autostart-cdp.ps1 -Revert
+```
+
+它只动用户作用域的三处，**不碰豆包安装目录**，所以豆包自动更新不会覆盖掉：
+
+| 入口 | 位置 |
+| --- | --- |
+| 开机自启 | `HKCU:\...\CurrentVersion\Run` 的 `doubao` 值 |
+| 开始菜单「豆包」 | `%APPDATA%\...\Start Menu\Programs\豆包.lnk` |
+| 开始菜单「豆包浏览器」 | `%APPDATA%\...\Start Menu\Programs\豆包浏览器.lnk` |
+
+原有参数（`--launch_from=auto_run`、`--saman-browser-entry`）会保留，脚本是幂等的，
+重复 `-Apply` 不会叠加。`-Apply` 会把原值备份到 `~/.dsh/doubao-cdp-autostart.json`。
+
+**覆盖不到的三条路径**：`doubao://` 协议跳转、系统托盘里的重启、更新器自己拉起的新进程。
+这些由豆包内部决定，改外部入口管不了 —— 交给下面的自动接管兜底。
+
+**单实例提醒**：豆包同一时刻只有一个实例。如果此刻已经有一个**不带参数**的豆包在跑，
+从开始菜单再点一次只会唤醒旧实例，端口不会开。必须让它冷启动一次（或跑一次启动脚本）。
+
+## 端口没了会怎样（自动接管）
+
+`server.mjs` 现在会自愈：任何 `doubao_*` 工具发现连不上调试端口，就自己把豆包
+带参数重启一次，然后再执行这次调用。实测（Windows 11，豆包 2.33.3）：
+
+| 场景 | 耗时 | 结果 |
+| --- | --- | --- |
+| 端口在，正常调用 | 0.15s | 正常 |
+| 端口丢失 → 自动重启 | 约 9s | 首次调用即拿到完整数据（39 个对话） |
+
+设计上的两个约束：
+
+- **单飞 + 冷却**：并发的多个工具调用只会触发一次重启，失败后 60 秒内不再重试，
+  避免一个坏掉的安装变成重启循环。
+- **会打断豆包**：重启就是 `taskkill` + 冷启动，**未发送的草稿会丢**，正在生成的回复会中断。
+  不想要这个行为就设 `DOUBAO_AUTO_RESTART=0`。
+
+每次自愈都记在 `~/.dsh/doubao-handoff/cdp-launch.log`，排查时先看它。
+
 ## 每次重启豆包后
 
-豆包退出/重启后调试端口就没了，`doubao_*` 工具会返回连接错误。
-再跑一次第 3 步的脚本即可。
+豆包退出/重启后调试端口就没了。**现在不需要手动做什么**：下一次 `doubao_*` 调用会
+自动把豆包重启一次并恢复连接（见上一节）。想手动控制，再跑一次第 3 步的脚本即可。
 
 ## 已知限制
 
@@ -123,6 +174,13 @@ export DOUBAO_EXE="/Applications/Doubao.app/Contents/MacOS/Doubao"
 - **任务模式会中途反问。** 豆包在信息不足时可能停下来问，这时 `doubao_handoff`
   返回 `needsUserInput: true`，用 `doubao_reply` 把答案送回去。
 - **对话气泡需要 DSH 的「对话视图」设为 verbose。** 见下方「豆包气泡怎么显示」。
+- **自启参数只管冷启动。** 豆包是单实例应用，已有实例在跑时新参数无效；`doubao://`
+  协议跳转、托盘重启、更新器拉起的进程也绕开了被改写的入口。
+- **自动接管会丢草稿。** 它靠 `taskkill` + 冷启动实现，未发送的内容会丢；用
+  `DOUBAO_AUTO_RESTART=0` 可关闭。
+- **`enable-autostart-cdp.ps1` 只支持 Windows**，且脚本必须带 UTF-8 BOM ——
+  Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当系统代码页读，中文字符串会破坏引号配对。
+
 
 
 ## 提供的工具
@@ -340,9 +398,11 @@ MCP 条目的 `env` 里可以覆盖（默认值见括号）：
 | --- | --- |
 | `DOUBAO_CDP` | CDP 地址（`http://127.0.0.1:9225`） |
 | `DOUBAO_BADGE_PORT` | 徽章状态接口端口（`9226`） |
-| `DOUBAO_HANDOFF_DIR` | 交接状态目录（`~/.dsh/doubao-handoff`） |
+| `DOUBAO_HANDOFF_DIR` | 交接状态目录（`~/.dsh/doubao-handoff`），自愈日志也写在这里 |
 | `DOUBAO_EXE` | 豆包可执行文件路径（跳过自动探测） |
 | `DOUBAO_CDP_PORT` | 启动脚本用的调试端口（`9225`） |
+| `DOUBAO_AUTO_RESTART` | 设为 `0` 关闭自动接管，连不上就报错 |
+| `DOUBAO_AUTO_RESTART_MIN_INTERVAL_MS` | 重启失败后的冷却时间（`60000`） |
 
 ## 已知限制
 
@@ -354,16 +414,21 @@ MCP 条目的 `env` 里可以覆盖（默认值见括号）：
 - **豆包更新可能改 DOM**：工具按 `data-testid` 和消息结构定位，豆包改版可能失效。
 - **macOS 未实机验证**：见上方「已知限制」。
 - **安全边界**：9225 只绑 `127.0.0.1`，但本机任意进程都能借此控制豆包。
-  不用的时侯关掉豆包或不用调试端口启动即可。
+  换个说法：只要你让豆包带着调试端口跑着，任何本机程序都能读你的对话、替你发消息。
+  不用的时侯回滚自启参数（`enable-autostart-cdp.ps1 -Revert`）或退出豆包。
+- **自启参数抗更新，但不抗单实例**：改的是注册表和快捷方式，豆包自动更新不会覆盖；
+  可是已有不带参数的实例在跑时，新参数不生效，必须冷启动。
 
 ## 目录内容
 
 | 文件 | 说明 |
 | --- | --- |
 | `server.mjs` | MCP server + CLI，全部逻辑 |
+| `lib/doubao-launcher.mjs` | 找可执行文件 / 停进程 / 带端口启动，启动器与自愈共用 |
 | `client.js` / `index.js` | 界面状态徽章 + 对话气泡（Client 插件） |
 | `cordis.patch.yml` | 挂载 MCP 与徽章 |
 | `tools/doctor.mjs` | **前置自检**（装之前就能跑，分层验证） |
+| `tools/enable-autostart-cdp.ps1` | **让豆包冷启动自带调试参数**（`-Status` / `-Apply` / `-Revert`） |
 | `tools/start-doubao-cdp.mjs` | **跨平台**启动器（Node，macOS/Linux 推荐） |
 | `tools/start-doubao-cdp.sh` | 跨平台 shell 版 |
 | `tools/start-doubao-cdp.ps1` | Windows PowerShell 版 |
