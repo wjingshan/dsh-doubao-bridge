@@ -32,6 +32,11 @@ const VERSION = (() => {
 // Handoff state lives under the harness home so it survives moving the package.
 const HANDOFF_DIR = process.env.DOUBAO_HANDOFF_DIR || path.join(os.homedir(), '.dsh', 'doubao-handoff');
 const STATE_FILE = path.join(HANDOFF_DIR, 'state.json');
+// Which project reuses which task conversation. Handoff/run-task write it; the
+// tools/doubao-task.mjs CLI reads and edits the same file.
+const TASKS_FILE = path.join(HANDOFF_DIR, 'tasks.json');
+// `DOUBAO_REUSE_TASK=0` forces every task into a fresh conversation.
+const REUSE_TASK = process.env.DOUBAO_REUSE_TASK !== '0';
 
 // Every knob can be overridden from the bundle config's `env` block.
 const ENDPOINT = process.env.DOUBAO_CDP || 'http://127.0.0.1:9225';
@@ -596,6 +601,76 @@ async function cmdConsult({ question, myAnalysis, focus, timeoutMs = 300000 }) {
   };
 }
 
+// ---------- task conversation registry ----------
+// The point of this registry: Doubao's task mode always starts from "新工作任务",
+// so without a record every handoff would begin with zero context. Keying on the
+// project path means "same project" is decided mechanically, not from memory.
+function readTasks() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8'));
+    if (!Array.isArray(data.tasks)) data.tasks = [];
+    return data;
+  } catch {
+    return { version: 1, tasks: [] };
+  }
+}
+
+function writeTasks(data) {
+  fs.mkdirSync(HANDOFF_DIR, { recursive: true });
+  fs.writeFileSync(TASKS_FILE, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  return data;
+}
+
+// Windows paths are case-insensitive and may mix separators; normalise before
+// comparing so "H:\Proj\" and "h:/proj" are the same project. A symbolic key
+// like "video-dedup" is NOT a path and must not be re-anchored to a cwd.
+function projectKey(p) {
+  if (!p) return null;
+  const s = String(p).trim().replace(/[\\/]+$/, '');
+  if (/^[a-zA-Z]:[\\/]/.test(s) || s.startsWith('/') || s.startsWith('\\\\')) {
+    return path.resolve(s).toLowerCase();
+  }
+  return s.toLowerCase();
+}
+
+function findTaskByProject(project) {
+  const key = projectKey(project);
+  if (!key) return null;
+  const data = readTasks();
+  return data.tasks.find((t) => projectKey(t.project) === key && t.status !== 'closed') || null;
+}
+
+function upsertTask({ project, conversationId, title, task }) {
+  if (!conversationId) return null;
+  const data = readTasks();
+  const key = projectKey(project);
+  const now = new Date().toISOString();
+  const i = key ? data.tasks.findIndex((t) => projectKey(t.project) === key) : -1;
+  const patch = {
+    conversationId,
+    lastTask: (task || '').slice(0, 300),
+    lastUsedAt: now,
+    status: 'active'
+  };
+  if (title) patch.title = title;
+  if (i >= 0) {
+    Object.assign(data.tasks[i], patch);
+  } else {
+    data.tasks.push({
+      project: project || null,
+      createdAt: now,
+      ...patch
+    });
+  }
+  writeTasks(data);
+  return data.tasks[i >= 0 ? i : data.tasks.length - 1];
+}
+
+function extractConversationId(url) {
+  const m = String(url || '').match(/chat\/(\d{6,})/);
+  return m ? m[1] : null;
+}
+
 // ---------- task mode + handoff ----------
 function readState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
@@ -764,6 +839,48 @@ async function driveTask({ send, evalJs, page }, text, timeoutMs, marker = 'HAND
   };
 }
 
+// Open an existing conversation by id and confirm we actually landed on it.
+// `el.click()` on a stale row can silently do nothing, so the URL is the check.
+async function openConversationById({ evalJs }, cid) {
+  const r = await evalJs(JS.openById(cid));
+  if (!r || !r.ok) return false;
+  await sleep(2200);
+  const url = await evalJs('location.href');
+  return String(url).includes(String(cid));
+}
+
+// Continue an EXISTING task conversation: identical send/click/wait mechanics as
+// driveTask, minus the "新工作任务" click.
+async function driveTaskInExisting({ send, evalJs, page }, text, timeoutMs, marker = 'HANDOFF-DONE') {
+  const before = await evalJs(JS.read);
+  const preRun = await evalJs(RUN_STATE_JS);
+  liveWindow = { url: page.url, startCount: before.count, at: Date.now() };
+
+  const focus = await evalJs(JS.focusEditor);
+  if (!focus.ok) throw new Error(focus.error || 'editor not ready in the reused task');
+
+  await send('Input.insertText', { text });
+  await sleep(600);
+  const typed = await evalJs(JS.editorText);
+
+  const clicked = await realClick(send, evalJs, `document.querySelector('[data-testid="chat_input_send_button"]')`);
+  if (!clicked.ok) throw new Error('send button not clickable');
+
+  const r = await waitForRun({ evalJs }, {
+    marker, timeoutMs, startedAt: Date.now(), baseline: preRun.assistantCount || 0
+  });
+  return {
+    typed,
+    elapsedMs: r.elapsedMs,
+    url: await evalJs('location.href'),
+    completed: r.status === 'done',
+    needsUserInput: r.status === 'needs-user',
+    timedOut: r.status === 'timeout',
+    question: r.status === 'needs-user' ? (r.snapshot.lastAssistant || '') : null,
+    reply: (r.snapshot && r.snapshot.lastAssistant) || null
+  };
+}
+
 // Feed an answer back into a run that is waiting at "正在询问用户".
 async function cmdReply({ answer, timeoutMs = 900000, marker = 'HANDOFF-DONE' }) {
   if (!answer) throw new Error('answer is required');
@@ -795,10 +912,23 @@ async function cmdReply({ answer, timeoutMs = 900000, marker = 'HANDOFF-DONE' })
   });
 }
 
-async function cmdRunTask({ task, timeoutMs = 600000 }) {
+async function cmdRunTask({ task, timeoutMs = 600000, key = null, reuse = REUSE_TASK }) {
   if (!task) throw new Error('task text is required');
+  const reused = reuse && key ? findTaskByProject(key) : null;
   return withPage(async (ctx) => {
-    const result = await driveTask(ctx, task, timeoutMs);
+    let result = null;
+    if (reused) {
+      const opened = await openConversationById(ctx, reused.conversationId);
+      if (opened) {
+        const r = await driveTaskInExisting(ctx, task, timeoutMs);
+        result = { ...r, reusedConversation: true, conversationId: reused.conversationId };
+      }
+    }
+    if (!result) {
+      const r = await driveTask(ctx, task, timeoutMs);
+      result = { ...r, reusedConversation: false, conversationId: extractConversationId(r.url) };
+    }
+    if (key) upsertTask({ project: key, conversationId: result.conversationId, task });
     writeState({ owner: 'doubao', status: 'done', task, since: new Date().toISOString(), taskUrl: result.url });
     return result;
   });
@@ -824,9 +954,12 @@ function buildHandoffText({ project, task }) {
   return lines.filter((l) => l !== null).join('\n');
 }
 
-async function cmdHandoff({ project, task, timeoutMs = 900000 }) {
+async function cmdHandoff({ project, task, timeoutMs = 900000, reuse = REUSE_TASK }) {
   if (!task) throw new Error('task text is required');
   if (project && !fs.existsSync(project)) throw new Error('project directory does not exist: ' + project);
+
+  // Same project → continue the conversation that already knows this codebase.
+  const reused = reuse && project ? findTaskByProject(project) : null;
 
   writeState({
     owner: 'doubao',
@@ -834,15 +967,37 @@ async function cmdHandoff({ project, task, timeoutMs = 900000 }) {
     task,
     project: project || null,
     since: new Date().toISOString(),
-    taskUrl: null
+    taskUrl: reused ? `chrome://doubao-chat/chat/${reused.conversationId}` : null
   });
 
   try {
-    const result = await withPage(async (ctx) => driveTask(ctx, buildHandoffText({ project, task }), timeoutMs));
+    const result = await withPage(async (ctx) => {
+      const text = buildHandoffText({ project, task });
+      if (reused) {
+        const opened = await openConversationById(ctx, reused.conversationId);
+        if (opened) {
+          const r = await driveTaskInExisting(ctx, text, timeoutMs);
+          return { ...r, reusedConversation: true, conversationId: reused.conversationId };
+        }
+        // Recorded conversation is gone (deleted or filtered out): fall through
+        // to a fresh task, and the registry is repointed below.
+      }
+      const r = await driveTask(ctx, text, timeoutMs);
+      return { ...r, reusedConversation: false, conversationId: extractConversationId(r.url) };
+    });
+
+    const conversationId = result.conversationId || extractConversationId(result.url);
+    if (project && conversationId) {
+      const rec = upsertTask({ project, conversationId, title: undefined, task });
+      if (rec) {
+        result.taskRecord = { project: rec.project, conversationId: rec.conversationId, status: rec.status };
+      }
+    }
+
     writeState({
       owner: 'doubao',
       status: result.completed ? 'done' : (result.needsUserInput ? 'waiting-user' : 'waiting'),
-      taskUrl: result.url
+      taskUrl: result.url || (conversationId ? `chrome://doubao-chat/chat/${conversationId}` : null)
     });
     return { ...result, handoff: readState() };
   } catch (err) {
@@ -1145,6 +1300,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         task: { type: 'string', description: 'Task instructions.' },
+        key: { type: 'string', description: 'Optional stable task key (a project path or short name like "video-dedup"). When a conversation was previously recorded under the same key, Doubao continues THAT task instead of opening a new one.' },
         timeoutMs: { type: 'number', description: 'Max wait in milliseconds (default 600000).' }
       },
       required: ['task'],
@@ -1153,12 +1309,13 @@ const TOOLS = [
   },
   {
     name: 'doubao_handoff',
-    description: 'Hand the current project over to Doubao task mode: records ownership state, opens a fresh task scoped to the project directory, submits the task, and waits for the run to settle. Use this when the user wants Doubao to do the work.',
+    description: 'Hand the current project over to Doubao task mode: records ownership state, submits the task, and waits for the run to settle. The same project path automatically continues the task conversation recorded for it (that conversation already knows the codebase); pass reuse=false to force a fresh one. Use this when the user wants Doubao to do the work.',
     inputSchema: {
       type: 'object',
       properties: {
         project: { type: 'string', description: 'Absolute path of the project/working directory Doubao may modify.' },
         task: { type: 'string', description: 'What Doubao should do in that directory.' },
+        reuse: { type: 'boolean', description: 'Continue the task conversation previously recorded for this project (default true). Set false to always open a fresh task.' },
         timeoutMs: { type: 'number', description: 'Max wait in milliseconds (default 900000).' }
       },
       required: ['project', 'task'],
@@ -1235,8 +1392,8 @@ async function callTool(name, args) {
     case 'doubao_ask': return await cmdAsk(args.text, args.timeoutMs || 180000);
     case 'doubao_mode': return await cmdMode();
     case 'doubao_new_task': return await cmdNewTask();
-    case 'doubao_run_task': return await cmdRunTask({ task: args.task, timeoutMs: args.timeoutMs });
-    case 'doubao_handoff': return await cmdHandoff({ project: args.project, task: args.task, timeoutMs: args.timeoutMs });
+    case 'doubao_run_task': return await cmdRunTask({ task: args.task, timeoutMs: args.timeoutMs, key: args.key });
+    case 'doubao_handoff': return await cmdHandoff({ project: args.project, task: args.task, timeoutMs: args.timeoutMs, reuse: args.reuse });
     case 'doubao_return': return await cmdReturn();
     case 'doubao_image': return await cmdImage({ prompt: args.prompt, timeoutMs: args.timeoutMs });
     case 'doubao_consult': return await cmdConsult({ question: args.question, myAnalysis: args.myAnalysis, focus: args.focus, timeoutMs: args.timeoutMs });

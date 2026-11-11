@@ -315,6 +315,45 @@ DSH  ◀──doubao_return()──────────────  最终�
   所以判定要求「至少两条消息 + 最后一条不是右侧用户气泡 + 含标记」，
   否则任务刚发出就会被误判成完成。
 
+### 同一项目自动复用同一个任务对话
+
+豆包任务模式每次都从「新工作任务」开始，所以不复用的话，每次 handoff 它都要
+**重新读一遍代码库、重新摸索**。`doubao_handoff` 因此带了一张登记表：
+
+| 动作 | 行为 |
+| --- | --- |
+| 第一次 handoff 某个 `project` | 开新工作任务，把 `project → 对话 id` 记进 `~/.dsh/doubao-handoff/tasks.json` |
+| 再次 handoff **同一个 `project`** | 打开上次那个对话，直接在那里面继续（它记得之前读过哪些文件） |
+| 记录的对话被删了 | 自动退回新建，并改写登记表 |
+| 想强制开新的 | `doubao_handoff({ ..., reuse: false })` |
+
+`project` 比较时做了规范化（大小写、分隔符、尾部斜杠），`H:\Proj\` 和 `h:/proj`
+视为同一个。查看或纠正登记表：
+
+```bash
+node tools/doubao-task.mjs list
+node tools/doubao-task.mjs get "H:\path\to\project"
+```
+
+`doubao_run_task` 没有项目概念，要复用就显式传 `key`（项目路径或短名）：
+`doubao_run_task({ task, key: "video-dedup" })`。
+
+**省的是什么、不省什么**（别把它当省 token 的开关）：
+
+- 省：豆包不必重新读代码、重新建立对项目的理解——这是大任务里最耗时的部分。
+- 不省：**豆包侧的输入 token 反而变多**。对话越来越长，每次请求的历史都要重发。
+- 不省：DSH 侧 token 不变，任务文本照样完整发过去。
+
+所以：同一项目连续迭代用它；对话长到开始跑偏或变慢，就 `reuse: false` 开新的。
+`DOUBAO_REUSE_TASK=0` 可以全局关掉这个行为。
+
+### ⚠️ 豆包是单实例，别让两个会话同时驱动它
+
+页面只有一份。两个 DSH 会话同时 handoff 时，后启动的会把页面切走，先启动的那个
+就会一直等 `HANDOFF-DONE`（实测被拖到 431 秒才恢复）。要么串行使用，要么接受
+其中一个会等很久。徽章状态是唯一能看出"现在归谁"的地方。
+
+
 ## 命令行（排错用）
 
 同一份 `server.mjs` 也能直接跑：
@@ -403,6 +442,7 @@ MCP 条目的 `env` 里可以覆盖（默认值见括号）：
 | `DOUBAO_CDP_PORT` | 启动脚本用的调试端口（`9225`） |
 | `DOUBAO_AUTO_RESTART` | 设为 `0` 关闭自动接管，连不上就报错 |
 | `DOUBAO_AUTO_RESTART_MIN_INTERVAL_MS` | 重启失败后的冷却时间（`60000`） |
+| `DOUBAO_REUSE_TASK` | 设为 `0` 关闭「同项目复用同一任务对话」，每次都开新任务 |
 
 ## 已知限制
 
