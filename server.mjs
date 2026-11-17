@@ -734,6 +734,17 @@ async function cmdMode() {
   }));
 }
 
+// List the available workbenches, or switch to one by name.
+async function cmdWorkbench({ name } = {}) {
+  return withPage(async (ctx) => {
+    if (!name) {
+      await gotoWorkbenchMarket(ctx);
+      return { current: await currentWorkbenchName(ctx.evalJs), available: await listWorkbenches(ctx.evalJs) };
+    }
+    return switchWorkbench(ctx, name);
+  });
+}
+
 async function cmdNewTask() {
   return withPage(async ({ send, evalJs }) => {
     const clicked = await realClick(send, evalJs,
@@ -998,6 +1009,92 @@ async function ensureProjectChat(ctx, name) {
   return { ok: true, created };
 }
 
+// ---------- 工作台切换 (2026-11) ----------
+// 工作台没有 URL 可寻址：只能走侧边栏「工作台」进市场页，再点目标卡片的「使用」。
+// 卡片 class 是带哈希的（card-XXXX），所以定位靠「含『使用』按钮 + 文本以工作台名开头」，
+// 不依赖哈希。
+const WORKBENCH_MARKET = '/chat/workbench';
+
+function currentWorkbenchName(evalJs) {
+  return evalJs(`(() => {
+    const el = document.querySelector('[data-testid="current-workbench-chip"]');
+    return el ? (el.innerText || '').trim() : null;
+  })()`);
+}
+
+// 市场页上每个可切换的卡片，返回它的工作台名。
+function listWorkbenches(evalJs) {
+  return evalJs(`(() => {
+    const out = [];
+    for (const b of document.querySelectorAll('button')) {
+      if ((b.innerText || '').trim() !== '使用') continue;
+      let card = b;
+      for (let i = 0; i < 6 && card.parentElement; i++) {
+        card = card.parentElement;
+        if ((card.innerText || '').includes('工作台')) break;
+      }
+      const t = (card.innerText || '').trim().replace(/\\s+/g, ' ');
+      const m = t.match(/^(.+?工作台)/);
+      if (m) out.push(m[1]);
+    }
+    return [...new Set(out)];
+  })()`);
+}
+
+async function gotoWorkbenchMarket(ctx) {
+  const { send, evalJs } = ctx;
+  if (String(await evalJs('location.href')).includes(WORKBENCH_MARKET)) return true;
+  const r = await rectOf(evalJs, `document.querySelector('[data-testid="sidebar_workbench_nav_button"]')`);
+  if (!r) return false;
+  await clickAt(send, r);
+  await sleep(2600);
+  return String(await evalJs('location.href')).includes(WORKBENCH_MARKET);
+}
+
+// 切到指定工作台。名字可以省略「工作台」三个字（"编程开发" 等价于 "编程开发工作台"）。
+async function switchWorkbench(ctx, name) {
+  const { send, evalJs } = ctx;
+  const want = String(name).endsWith('工作台') ? String(name) : `${name}工作台`;
+
+  if ((await currentWorkbenchName(evalJs)) === want) {
+    return { ok: true, already: true, name: want };
+  }
+
+  if (!(await gotoWorkbenchMarket(ctx))) {
+    return { ok: false, name: want, error: 'cannot open the workbench market page' };
+  }
+  await sleep(600);
+
+  const hit = await evalJs(`(() => {
+    const WANT = ${JSON.stringify(want)};
+    for (const b of document.querySelectorAll('button')) {
+      if ((b.innerText || '').trim() !== '使用') continue;
+      let card = b;
+      for (let i = 0; i < 6 && card.parentElement; i++) {
+        card = card.parentElement;
+        const t = (card.innerText || '').trim();
+        if (t.startsWith(WANT)) {
+          b.scrollIntoView({ block: 'center' });
+          const r = b.getBoundingClientRect();
+          if (r.width < 8) return { ok: false, error: 'use button not visible' };
+          return { ok: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+        }
+      }
+    }
+    return { ok: false, error: 'workbench card not found' };
+  })()`);
+
+  if (!hit || !hit.ok) {
+    return { ok: false, name: want, error: hit ? hit.error : 'card lookup failed', available: await listWorkbenches(evalJs) };
+  }
+
+  await clickAt(send, { x: hit.x, y: hit.y });
+  await sleep(2600);
+
+  const now = await currentWorkbenchName(evalJs);
+  return { ok: now === want, name: want, current: now };
+}
+
 // Feed an answer back into a run that is waiting at "正在询问用户".
 async function cmdReply({ answer, timeoutMs = 900000, marker = 'HANDOFF-DONE' }) {
   if (!answer) throw new Error('answer is required');
@@ -1071,7 +1168,7 @@ function buildHandoffText({ project, task }) {
   return lines.filter((l) => l !== null).join('\n');
 }
 
-async function cmdHandoff({ project, task, timeoutMs = 900000, reuse = REUSE_TASK }) {
+async function cmdHandoff({ project, task, timeoutMs = 900000, reuse = REUSE_TASK, workbench = null }) {
   if (!task) throw new Error('task text is required');
   if (project && !fs.existsSync(project)) throw new Error('project directory does not exist: ' + project);
 
@@ -1090,37 +1187,53 @@ async function cmdHandoff({ project, task, timeoutMs = 900000, reuse = REUSE_TAS
   try {
     const result = await withPage(async (ctx) => {
       const text = buildHandoffText({ project, task });
+      let workbenchError = null;
+      // 先切工作台，再进对话：切换会把页面带到市场页，晚于导航会把对话冲掉。
+      if (workbench) {
+        const w = await switchWorkbench(ctx, workbench);
+        if (!w.ok) workbenchError = w.error || 'workbench switch failed';
+      }
+
+      let inner = null;
+      let projectError = null;
+
       if (reused) {
         const opened = await openConversationById(ctx, reused.conversationId);
         if (opened) {
           const r = await driveTaskInExisting(ctx, text, timeoutMs);
-          return { ...r, reusedConversation: true, conversationId: reused.conversationId };
+          inner = { ...r, reusedConversation: true, conversationId: reused.conversationId };
         }
         // Recorded conversation is gone (deleted or filtered out): fall through
         // to the project/new-task paths, and the registry is repointed below.
       }
+
       // 没有记录（或记录已失效）：按「目录名 = 项目名」进项目内部的新对话。
-      let projectError = null;
-      if (reuse && project) {
+      if (!inner && reuse && project) {
         const dirName = path.basename(project);
         const inProject = await ensureProjectChat(ctx, dirName);
         if (inProject.ok) {
           const r = await driveTaskInExisting(ctx, text, timeoutMs);
-          return {
+          inner = {
             ...r,
             reusedConversation: false,
             inProject: dirName,
             projectCreated: !!inProject.created,
             conversationId: extractConversationId(r.url)
           };
+        } else {
+          projectError = inProject.error;
         }
-        projectError = inProject.error;
       }
-      const r = await driveTask(ctx, text, timeoutMs);
+
+      if (!inner) {
+        const r = await driveTask(ctx, text, timeoutMs);
+        inner = { ...r, reusedConversation: false, conversationId: extractConversationId(r.url) };
+      }
+
       return {
-        ...r,
-        reusedConversation: false,
-        conversationId: extractConversationId(r.url),
+        ...inner,
+        ...(workbench ? { workbench } : {}),
+        ...(workbenchError ? { workbenchFallback: workbenchError } : {}),
         ...(projectError ? { projectFallback: projectError } : {})
       };
     });
@@ -1423,6 +1536,17 @@ const TOOLS = [
     }
   },
   {
+    name: 'doubao_workbench',
+    description: 'List Doubao\'s 22 workbenches, or switch the active one by name (e.g. "编程开发" or "编程开发工作台"). Switching changes the default prompt and quick tasks for later conversations. Pass no name to list.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Workbench name; the trailing 工作台 is optional. Omit to list all available workbenches.' }
+      },
+      additionalProperties: false
+    }
+  },
+  {
     name: 'doubao_mode',
     description: 'Report whether the open Doubao window is in chat mode or task (work) mode, plus the current handoff ownership state.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false }
@@ -1455,6 +1579,7 @@ const TOOLS = [
         project: { type: 'string', description: 'Absolute path of the project/working directory Doubao may modify.' },
         task: { type: 'string', description: 'What Doubao should do in that directory.' },
         reuse: { type: 'boolean', description: 'Continue the task conversation previously recorded for this project (default true). Set false to always open a fresh task.' },
+        workbench: { type: 'string', description: 'Optional Doubao workbench to switch to before running (e.g. "编程开发" for code work, "数据分析", "创意设计"). See docs/workbenches.md. A failed switch is reported as workbenchFallback but does not abort the handoff.' },
         timeoutMs: { type: 'number', description: 'Max wait in milliseconds (default 900000).' }
       },
       required: ['project', 'task'],
@@ -1530,9 +1655,10 @@ async function callTool(name, args) {
     case 'doubao_send': return await cmdSend(args.text);
     case 'doubao_ask': return await cmdAsk(args.text, args.timeoutMs || 180000);
     case 'doubao_mode': return await cmdMode();
+    case 'doubao_workbench': return await cmdWorkbench({ name: args.name });
     case 'doubao_new_task': return await cmdNewTask();
     case 'doubao_run_task': return await cmdRunTask({ task: args.task, timeoutMs: args.timeoutMs, key: args.key });
-    case 'doubao_handoff': return await cmdHandoff({ project: args.project, task: args.task, timeoutMs: args.timeoutMs, reuse: args.reuse });
+    case 'doubao_handoff': return await cmdHandoff({ project: args.project, task: args.task, timeoutMs: args.timeoutMs, reuse: args.reuse, workbench: args.workbench });
     case 'doubao_return': return await cmdReturn();
     case 'doubao_image': return await cmdImage({ prompt: args.prompt, timeoutMs: args.timeoutMs });
     case 'doubao_consult': return await cmdConsult({ question: args.question, myAnalysis: args.myAnalysis, focus: args.focus, timeoutMs: args.timeoutMs });
@@ -1606,9 +1732,18 @@ async function cliMain() {
   else if (cmd === 'send') out = await cmdSend(rest.join(' '));
   else if (cmd === 'ask') out = await cmdAsk(rest.join(' '));
   else if (cmd === 'mode') out = await cmdMode();
+  else if (cmd === 'workbench') out = await cmdWorkbench({ name: rest.join(' ') || undefined });
   else if (cmd === 'new-task') out = await cmdNewTask();
   else if (cmd === 'run-task') out = await cmdRunTask({ task: rest.join(' ') });
-  else if (cmd === 'handoff') out = await cmdHandoff({ project: rest[0], task: rest.slice(1).join(' ') });
+  else if (cmd === 'handoff') {
+    const wbArg = rest.find((a) => a.startsWith('--workbench='));
+    const pos = rest.filter((a) => !a.startsWith('--'));
+    out = await cmdHandoff({
+      project: pos[0],
+      task: pos.slice(1).join(' '),
+      workbench: wbArg ? wbArg.slice('--workbench='.length) : null
+    });
+  }
   else if (cmd === 'return') out = await cmdReturn();
   else if (cmd === 'image') out = await cmdImage({ prompt: rest.join(' ') });
   else if (cmd === 'consult') out = await cmdConsult({ question: rest.join(' ') });

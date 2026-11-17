@@ -351,6 +351,23 @@ node tools/doubao-task.mjs get "H:\path\to\project"
 所以：同一项目连续迭代用它；对话长到开始跑偏或变慢，就 `reuse: false` 开新的。
 `DOUBAO_REUSE_TASK=0` 可以全局关掉这个行为。
 
+### 切换工作台（程序化）
+
+工作台决定豆包的默认提示词和快捷任务（22 个，清单见 [`docs/workbenches.md`](docs/workbenches.md)）。
+可以程序化切换，不必手点：
+
+- `doubao_workbench({ name: "编程开发" })` —— 名字末尾的「工作台」可省略；不传 `name` 就列出全部。
+- `doubao_handoff({ project, task, workbench: "编程开发" })` —— 跑任务前先切过去。
+  切换失败只会记一个 `workbenchFallback`，**不会中断任务**。
+- CLI：`node server.mjs workbench`（列出）、`node server.mjs workbench 数据分析`（切换）、
+  `node server.mjs handoff <dir> <task> --workbench=编程开发`。
+
+实现路径：侧边栏「工作台」→ 市场页（`/chat/workbench`）→ 目标卡片的「使用」。
+
+注意卡片 class 带构建哈希（`card-DraP9c` 这类），所以定位**不依赖哈希**，而是
+「含『使用』按钮 + 卡片文本以工作台名开头」；顶部 `current-workbench-chip` 用来读写当前工作台，
+切换后再读一次做校验。实测切换 3.7s，`handoff` 带切换的端到端 33.7s（含建项目）。
+
 ### ⚠️ 豆包是单实例，别让两个会话同时驱动它
 
 页面只有一份。两个 DSH 会话同时 handoff 时，后启动的会把页面切走，先启动的那个
