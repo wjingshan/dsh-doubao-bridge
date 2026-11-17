@@ -894,6 +894,110 @@ async function driveTaskInExisting({ send, evalJs, page }, text, timeoutMs, mark
   };
 }
 
+// ---------- 豆包「项目」(2026-11) ----------
+// 项目是「项目 → 对话」的容器：项目行本身没有 id，也不能直接发消息，只有行内的
+// aria-label="新对话" 能在项目内部开一个对话。约定：本地目录名 = 项目名。
+// 这条路径一旦失败就退回「新工作任务」，绝不让 handoff 因为 UI 改版而中断。
+const PROJECT_CREATE_TRIGGER = '[data-testid="conversation-list-v2-project-create-menu-trigger"]';
+
+async function clickAt(send, { x, y }) {
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+  await sleep(150);
+  await send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+  await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+}
+
+function rectOf(evalJs, expr) {
+  return evalJs(`(() => {
+    const el = ${expr};
+    if (!el) return null;
+    el.scrollIntoView({ block: 'center' });
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return null;
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+  })()`);
+}
+
+// 项目行：hover 才会露出操作按钮。
+function projectNewChatRect(evalJs, name) {
+  return evalJs(`(() => {
+    const NAME = ${JSON.stringify(name)};
+    const side = document.querySelector('[data-testid="flow_chat_sidebar"]');
+    if (!side) return null;
+    const sec = [...side.querySelectorAll('section')].find(s => (s.innerText || '').trim().startsWith(NAME));
+    if (!sec) return null;
+    const row = sec.querySelector('[class*="project-row"]') || sec;
+    row.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    const btn = [...sec.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === '新对话');
+    if (!btn) return null;
+    const r = btn.getBoundingClientRect();
+    if (r.width < 8) return null;
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+  })()`);
+}
+
+async function projectExists(evalJs, name) {
+  return evalJs(`(() => {
+    const NAME = ${JSON.stringify(name)};
+    const side = document.querySelector('[data-testid="flow_chat_sidebar"]');
+    if (!side) return false;
+    return [...side.querySelectorAll('section')].some(s => (s.innerText || '').trim().startsWith(NAME));
+  })()`);
+}
+
+// 「创建项目」对话框：填项目名称 → 创建。工作目录留空（任务文本里已写明路径）。
+async function createProjectByName({ send, evalJs }, name) {
+  const trigger = await rectOf(evalJs, `document.querySelector(${JSON.stringify(PROJECT_CREATE_TRIGGER)})`);
+  if (!trigger) return { ok: false, error: 'create-project trigger not found' };
+  await clickAt(send, trigger);
+  await sleep(1400);
+
+  const input = await rectOf(evalJs, `document.querySelector('[role="dialog"] input[placeholder*="项目名称"]')`);
+  if (!input) return { ok: false, error: 'project name input missing' };
+  await clickAt(send, input);
+  await send('Input.insertText', { text: name });
+  await sleep(400);
+
+  const typed = await evalJs(`(() => {
+    const d = document.querySelector('[role="dialog"]');
+    const i = d && d.querySelector('input[placeholder*="项目名称"]');
+    return i ? i.value : null;
+  })()`);
+  if (typed !== name) return { ok: false, error: `name not accepted (got ${JSON.stringify(typed)})` };
+
+  const createBtn = await rectOf(evalJs, `(() => {
+    const d = document.querySelector('[role="dialog"]');
+    return d ? [...d.querySelectorAll('button')].find(b => (b.innerText || '').trim() === '创建') : null;
+  })()`);
+  if (!createBtn) return { ok: false, error: '创建 button not found' };
+  await clickAt(send, createBtn);
+  await sleep(2600);
+
+  const stillOpen = await evalJs(`!!document.querySelector('[role="dialog"]')`);
+  if (stillOpen) return { ok: false, error: 'dialog did not close after 创建' };
+  return { ok: (await projectExists(evalJs, name)) ? true : false, error: 'project not visible after create' };
+}
+
+// 确保存在名为 name 的项目，并进入它内部的新对话。
+async function ensureProjectChat(ctx, name) {
+  const { send, evalJs } = ctx;
+  let exists = await projectExists(evalJs, name);
+  let created = false;
+  if (!exists) {
+    const c = await createProjectByName(ctx, name);
+    if (!c.ok) return { ok: false, error: c.error };
+    created = true;
+    await sleep(1200);
+  }
+  const rect = await projectNewChatRect(evalJs, name);
+  if (!rect) return { ok: false, error: '新对话 button not found on project row' };
+  await clickAt(send, rect);
+  await sleep(2600);
+  const ready = await evalJs(`!!document.querySelector('div.tiptap[contenteditable="true"]')`);
+  if (!ready) return { ok: false, error: 'composer not ready in project chat' };
+  return { ok: true, created };
+}
+
 // Feed an answer back into a run that is waiting at "正在询问用户".
 async function cmdReply({ answer, timeoutMs = 900000, marker = 'HANDOFF-DONE' }) {
   if (!answer) throw new Error('answer is required');
@@ -993,10 +1097,32 @@ async function cmdHandoff({ project, task, timeoutMs = 900000, reuse = REUSE_TAS
           return { ...r, reusedConversation: true, conversationId: reused.conversationId };
         }
         // Recorded conversation is gone (deleted or filtered out): fall through
-        // to a fresh task, and the registry is repointed below.
+        // to the project/new-task paths, and the registry is repointed below.
+      }
+      // 没有记录（或记录已失效）：按「目录名 = 项目名」进项目内部的新对话。
+      let projectError = null;
+      if (reuse && project) {
+        const dirName = path.basename(project);
+        const inProject = await ensureProjectChat(ctx, dirName);
+        if (inProject.ok) {
+          const r = await driveTaskInExisting(ctx, text, timeoutMs);
+          return {
+            ...r,
+            reusedConversation: false,
+            inProject: dirName,
+            projectCreated: !!inProject.created,
+            conversationId: extractConversationId(r.url)
+          };
+        }
+        projectError = inProject.error;
       }
       const r = await driveTask(ctx, text, timeoutMs);
-      return { ...r, reusedConversation: false, conversationId: extractConversationId(r.url) };
+      return {
+        ...r,
+        reusedConversation: false,
+        conversationId: extractConversationId(r.url),
+        ...(projectError ? { projectFallback: projectError } : {})
+      };
     });
 
     const conversationId = result.conversationId || extractConversationId(result.url);
