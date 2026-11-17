@@ -302,7 +302,14 @@ const JS = {
 
   focusEditor: `(() => {
     const ed = document.querySelector('div.tiptap[contenteditable="true"]');
-    if (!ed) return { ok: false, error: 'editor not found' };
+    if (!ed) {
+      // The 2026-11 workbench home has no composer at all. Say so, instead of a
+      // bare "editor not found" that reads like a bug in the bridge.
+      const onWorkbench = location.href.indexOf('/chat/workbench') >= 0;
+      return { ok: false, error: onWorkbench
+        ? 'doubao is on the 工作台 home page, which has no composer. Open a conversation first: doubao_open_chat or doubao_new_chat.'
+        : 'editor not found' };
+    }
     ed.focus();
     const r = document.createRange();
     r.selectNodeContents(ed); r.collapse(false);
@@ -686,13 +693,19 @@ function writeState(patch) {
 
 const MODE_JS = `(() => {
   const t = document.body.innerText || '';
+  const href = location.href;
   const workLanding = t.includes('今天有什么工作要处理');
   const taskWorkspace = /对话产物/.test(t) && /最近文件/.test(t);
+  // 2026-11 版把首页改成了「工作台」市场页（/chat/workbench）：既不是旧的
+  // 工作首页，也不是任务工作区，也没有输入框。不单独识别就会被误报成 chat。
+  const workbench = href.indexOf('/chat/workbench') >= 0
+    || (t.indexOf('定制专属工作台') >= 0 && t.indexOf('智能工作台') >= 0);
   return {
-    href: location.href,
+    href,
     workLanding,
     taskWorkspace,
-    mode: (workLanding || taskWorkspace) ? 'task' : 'chat'
+    workbench,
+    mode: workbench ? 'workbench' : ((workLanding || taskWorkspace) ? 'task' : 'chat')
   };
 })()`;
 
