@@ -1,6 +1,6 @@
 {
   "name": "dsh-doubao-bridge",
-  "version": "3.4.0",
+  "version": "3.4.1",
   "type": "module",
   "description": "Drive the local Doubao (豆包) desktop app from DeepSeek Harness: read chats, send tasks, hand a project over and take it back.",
   "keywords": [
@@ -12,6 +12,14 @@
     "bridge"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wjingshan/dsh-doubao-bridge.git"
+  },
+  "homepage": "https://github.com/wjingshan/dsh-doubao-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/wjingshan/dsh-doubao-bridge/issues"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js"
@@ -25,14 +33,16 @@
     "server.mjs",
     "lib/",
     "cordis.patch.yml",
+    "docs/",
     "tools/"
   ],
   "engines": {
     "node": ">=22"
   },
   "scripts": {
+    "bootstrap": "node tools/bootstrap.mjs",
     "start-cdp": "node tools/start-doubao-cdp.mjs",
-    "check": "node --check server.mjs && node --check client.js && node --check lib/doubao-launcher.mjs && node --check tools/start-doubao-cdp.mjs",
+    "check": "node --check server.mjs && node --check client.js && node --check lib/doubao-launcher.mjs && node --check tools/start-doubao-cdp.mjs && node --check tools/bootstrap.mjs",
     "doctor": "node tools/doctor.mjs"
   },
   "dsh": {

@@ -52,18 +52,30 @@ CDP 是否响应 → 是否找到豆包聊天页面 →（如果已装）徽章�
 
 三步，第一步只需要做一次。
 
+> **换一台电脑？** 直接看 [`docs/other-machine.md`](docs/other-machine.md)——
+> 那份文档按「新机器从零到能用」写，含排错表和更新方式。下面是同一件事的简版。
+
 ### 1. 拿到插件
 
 ```bash
-git clone https://github.com/<你的用户名>/dsh-doubao-bridge.git
+git clone https://github.com/wjingshan/dsh-doubao-bridge.git
 cd dsh-doubao-bridge
 ```
 
-或者直接下载 zip 解压。
+或者直接下载 zip 解压。**放在以后不会挪动的目录**：安装用的是 `link:`，目录一挪就失效。
 
 ### 2. 装进 profile
 
-如果该 profile 由 `dsh` CLI 管理：
+一条命令搞定依赖、bundle 登记和 `pnpm install`：
+
+```bash
+node tools/bootstrap.mjs --profile <profile>      # 只有一个 profile 时可省略 --profile
+```
+
+先看它打算做什么（不改任何文件）：加 `--dry-run`。
+重复执行安全；要撤掉加 `--uninstall`。改 `package.json` 前会自动备份。
+
+想手工装也行：
 
 ```bash
 dsh plugin --profile <profile> add /完整路径/dsh-doubao-bridge
@@ -72,6 +84,9 @@ dsh plugin --profile <profile> add /完整路径/dsh-doubao-bridge
 > Windows 下如果 profile 由 DSH 桌面应用管理（`desktop` 就是这样，CLI 会拒绝），
 > 在 DSH 的插件页里从本地目录安装，或让 agent 调 `plugin_manager install_bundle`
 > 并以包目录为 target。
+
+**手工装的两步都不能少**：`dependencies` 里有它（`node_modules/dsh-doubao-bridge` 存在），
+并且 `dsh.profile.bundles` 里也有它。只做前一步，DSH 不会加载，表现就是「没有 doubao_* 工具」。
 
 ### 3. 让豆包开启调试端口
 
@@ -489,6 +504,8 @@ MCP 条目的 `env` 里可以覆盖（默认值见括号）：
 | `client.js` / `index.js` | 界面状态徽章 + 对话气泡（Client 插件） |
 | `cordis.patch.yml` | 挂载 MCP 与徽章 |
 | `tools/doctor.mjs` | **前置自检**（装之前就能跑，分层验证） |
+| `tools/bootstrap.mjs` | **换机一键安装**（写依赖 + 登记 bundle + `pnpm install`，支持 `--dry-run` / `--uninstall` / `--autostart`） |
+| `docs/other-machine.md` | 新机器从零到能用的完整流程 + 排错表 |
 | `tools/enable-autostart-cdp.ps1` | **让豆包冷启动自带调试参数**（`-Status` / `-Apply` / `-Revert`） |
 | `tools/start-doubao-cdp.mjs` | **跨平台**启动器（Node，macOS/Linux 推荐） |
 | `tools/start-doubao-cdp.sh` | 跨平台 shell 版 |
